@@ -2,7 +2,7 @@
 
 This is the core logic and API server for the JobPortal AI platform. Built with Python and FastAPI, it handles everything from data persistence, JWT authentication, background job scraping, and real-time AI resume analysis via Google Gemini.
 
-## 🛠️ Technology Stack
+## Technology Stack
 - **Framework:** FastAPI (High-performance, async-ready Python web framework)
 - **Database:** SQLite & SQLAlchemy (ORM for relational data management)
 - **Authentication:** JWT (JSON Web Tokens) with Passlib & Bcrypt (Password hashing)
@@ -11,7 +11,7 @@ This is the core logic and API server for the JobPortal AI platform. Built with 
 - **Task Scheduling:** APScheduler (for automated, background cron jobs)
 - **PDF Parsing:** PyPDF2 (for extracting text from uploaded resumes)
 
-## 📂 Project Architecture
+## Project Architecture
 ```
 backend/
 ├── database.py       # SQLAlchemy engine and session management
@@ -32,7 +32,7 @@ backend/
     └── indeed.py       # Scraper module
 ```
 
-## 🧠 Core Features
+## Core Features
 
 ### 1. The Scraper Engine
 Located in the `scrapers/` folder, this engine programmatically crawls external job boards. It can be triggered manually via the Admin Dashboard or left to run on an automated interval managed by `APScheduler`. Real-time progress is streamed back to the frontend using **Server-Sent Events (SSE)**.
@@ -43,7 +43,7 @@ The `/api/resume/analyze` endpoint accepts a PDF file and the IDs of the jobs th
 ### 3. Analytics & Admin Controls
 A robust admin panel tracks unique site visitors (via hashed IP addresses for privacy) and external API usage. Administrators can configure how often the scraper runs (1-30 days) and set hard daily limits on Gemini API calls to control costs.
 
-## 🚀 Getting Started
+## Getting Started
 
 1. Ensure Python 3.10+ is installed.
 2. Navigate to the `backend` directory: `cd backend`
