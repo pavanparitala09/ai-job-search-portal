@@ -44,6 +44,10 @@ export default function ResumeAnalyzer() {
   const [error, setError] = useState('');
   const [aiStatus, setAiStatus] = useState(null);
 
+  const [letterLoading, setLetterLoading] = useState(false);
+  const [activeLetter, setActiveLetter] = useState(null); // { text, jobTitle, company }
+  const [letterError, setLetterError] = useState('');
+
   // Check Gemini status on mount
   useEffect(() => {
     API.get('/api/resume/status')
@@ -82,6 +86,28 @@ export default function ResumeAnalyzer() {
     }
   };
 
+  const handleGenerateCoverLetter = async (jobId, jobTitle, company) => {
+    setLetterLoading(true);
+    setLetterError('');
+    setActiveLetter(null);
+    try {
+      const res = await API.post('/api/resume/generate-cover-letter', {
+        resume_text: result?.resume_text || resumeText,
+        job_id: jobId
+      });
+      setActiveLetter({
+        text: res.data.cover_letter,
+        jobTitle: res.data.job_title,
+        company: res.data.company
+      });
+    } catch (err) {
+      const msg = err?.response?.data?.detail || 'Failed to generate cover letter. Make sure your Groq API key is valid.';
+      setLetterError(msg);
+    } finally {
+      setLetterLoading(false);
+    }
+  };
+
   return (
     <div className="page">
       <div className="container">
@@ -89,7 +115,7 @@ export default function ResumeAnalyzer() {
         {/* Header */}
         <div className="page-header">
           <h1>🤖 Resume <span className="gradient-text">AI Analyzer</span></h1>
-          <p>Upload your resume — Gemini AI will match it against real scraped jobs, detect skills, and give personalized tips.</p>
+          <p>Upload your resume — Groq AI will match it against real scraped jobs, detect skills, and give personalized tips.</p>
         </div>
 
         {/* AI Status badge */}
@@ -160,7 +186,7 @@ export default function ResumeAnalyzer() {
                 {loading ? (
                   <span style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem' }}>
                     <div className="spinner" style={{ width: 16, height: 16, borderWidth: 2 }} />
-                    Gemini is analyzing…
+                    Groq is analyzing…
                   </span>
                 ) : (
                   <span style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem' }}>
@@ -209,7 +235,40 @@ export default function ResumeAnalyzer() {
           <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
             {result ? (
               <>
-                {/* Score card */}
+                {/* Fallback warning banner */}
+                {result.powered_by === 'TF-IDF' && (
+                  <div style={{
+                    padding: '1rem',
+                    background: 'rgba(245,158,11,0.08)',
+                    borderRadius: 'var(--radius-md)',
+                    border: '1px solid rgba(245,158,11,0.3)',
+                    color: 'var(--orange)',
+                    fontSize: '0.86rem',
+                    lineHeight: 1.5,
+                  }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontWeight: 700, marginBottom: '0.4rem' }}>
+                      <AlertCircle size={16} /> Running in TF-IDF Fallback Mode
+                    </div>
+                    {result.gemini_summary === '⚠️ limit_exceeded' ? (
+                      <>
+                        The daily AI analysis limit set by the administrator has been reached. 
+                        As a result, detailed mistakes, improvement suggestions, and professional career summaries are temporarily unavailable. 
+                        Please come back tomorrow when the daily limit resets.
+                      </>
+                    ) : (
+                      <>
+                        Groq AI was unavailable (check the status badge above for details). 
+                        As a result, detailed mistakes, improvement suggestions, and professional career summaries are not available. 
+                        The score shown is estimated using basic text-similarity matching against jobs in the database. 
+                        Please set a valid <strong>GROQ_API_KEY</strong> in <code>backend/.env</code> to enable full AI capabilities.
+                      </>
+                    )}
+                  </div>
+                )}
+
+                {result.gemini_summary !== '⚠️ limit_exceeded' && (
+                  <>
+                    {/* Score card */}
                 <div className="analytics-card" style={{ textAlign: 'center', padding: '1.75rem' }}>
                   <h3 style={{ justifyContent: 'center', marginBottom: '1rem' }}>Resume Score</h3>
                   <ScoreMeter score={result.overall_score} />
@@ -218,10 +277,10 @@ export default function ResumeAnalyzer() {
                   </p>
                 </div>
 
-                {/* Gemini summary */}
+                {/* Groq summary */}
                 {result.gemini_summary && !result.gemini_summary.startsWith('⚠️') && (
                   <div className="analytics-card" style={{ borderColor: 'rgba(124,58,237,0.3)', background: 'rgba(124,58,237,0.06)' }}>
-                    <h3><Sparkles size={14} /> Gemini Assessment</h3>
+                    <h3><Sparkles size={14} /> Groq Assessment</h3>
                     <p style={{ color: 'var(--text-secondary)', fontSize: '0.875rem', lineHeight: 1.6 }}>
                       {result.gemini_summary}
                     </p>
@@ -280,15 +339,31 @@ export default function ResumeAnalyzer() {
                             </p>
                           )}
 
-                          <a href={match.apply_link || '#'} target="_blank" rel="noopener noreferrer"
-                            style={{ fontSize: '0.75rem', color: 'var(--purple-light)', textDecoration: 'none', fontWeight: 600 }}>
-                            Apply on {match.source} →
-                          </a>
+                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: '0.5rem' }}>
+                            <a href={match.apply_link || '#'} target="_blank" rel="noopener noreferrer"
+                              style={{ fontSize: '0.75rem', color: 'var(--purple-light)', textDecoration: 'none', fontWeight: 600 }}>
+                              Apply on {match.source} →
+                            </a>
+                            <button 
+                              onClick={() => handleGenerateCoverLetter(match.job_id, match.title, match.company)}
+                              style={{
+                                display: 'inline-flex', alignItems: 'center', gap: '0.3rem',
+                                padding: '0.3rem 0.7rem', borderRadius: 4,
+                                background: 'rgba(168,85,247,0.12)', border: '1px solid rgba(168,85,247,0.3)',
+                                color: 'var(--purple-light)', fontSize: '0.72rem', fontWeight: 600,
+                                cursor: 'pointer', transition: 'all 0.2s ease',
+                              }}
+                            >
+                              📄 Cover Letter
+                            </button>
+                          </div>
                         </div>
                       </div>
                     ))}
                   </div>
                 </div>
+                  </>
+                )}
               </>
             ) : (
               <div className="analytics-card" style={{ textAlign: 'center', padding: '3rem 2rem' }}>
@@ -296,13 +371,105 @@ export default function ResumeAnalyzer() {
                 <h3 style={{ marginBottom: '0.5rem' }}>Ready to Analyze</h3>
                 <p style={{ color: 'var(--text-muted)', fontSize: '0.875rem', lineHeight: 1.6 }}>
                   {aiStatus?.gemini_ready
-                    ? 'Gemini AI is ready. Upload your resume or paste the text, then click "Analyze with AI".'
-                    : 'Upload your resume to get started. Add your Gemini API key in backend/.env for better results.'}
+                    ? 'Groq AI is ready. Upload your resume or paste the text, then click "Analyze with AI".'
+                    : 'Upload your resume to get started. Add your Groq API key in backend/.env for better results.'}
                 </p>
               </div>
             )}
           </div>
         </div>
+        {/* Cover Letter Modal */}
+        {(letterLoading || activeLetter || letterError) && (
+          <div className="modal-overlay" style={{
+            position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+            background: 'rgba(0,0,0,0.8)', display: 'flex', alignItems: 'center',
+            justifyContent: 'center', zIndex: 1000, padding: '1rem',
+          }}>
+            <div className="analytics-card" style={{
+              maxWidth: '650px', width: '100%', maxHeight: '90vh',
+              display: 'flex', flexDirection: 'column', gap: '1rem',
+              boxShadow: '0 20px 25px -5px rgba(0,0,0,0.5)',
+              border: '1px solid rgba(255,255,255,0.1)',
+              background: '#121214',
+            }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid rgba(255,255,255,0.06)', paddingBottom: '0.75rem' }}>
+                <h3 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  📄 AI Cover Letter Generator
+                </h3>
+                <button 
+                  onClick={() => { setActiveLetter(null); setLetterLoading(false); setLetterError(''); }}
+                  style={{ background: 'none', border: 'none', color: 'var(--text-muted)', fontSize: '1.2rem', cursor: 'pointer' }}
+                >
+                  ✕
+                </button>
+              </div>
+
+              {letterLoading && (
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '1rem', padding: '3rem 0' }}>
+                  <div className="spinner" style={{ width: 40, height: 40, borderWidth: 3 }} />
+                  <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem' }}>Groq AI is writing your cover letter...</p>
+                </div>
+              )}
+
+              {letterError && (
+                <div style={{ padding: '2rem 1rem', textAlign: 'center' }}>
+                  <p style={{ color: '#ef4444', marginBottom: '1rem', fontSize: '0.9rem' }}>⚠️ {letterError}</p>
+                  <button 
+                    className="page-btn" 
+                    onClick={() => { setActiveLetter(null); setLetterLoading(false); setLetterError(''); }}
+                  >
+                    Close
+                  </button>
+                </div>
+              )}
+
+              {activeLetter && (
+                <>
+                  <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                    Tailored for <strong>{activeLetter.jobTitle}</strong> at <strong>{activeLetter.company}</strong>
+                  </div>
+                  <textarea
+                    style={{
+                      width: '100%', minHeight: '320px', flex: 1,
+                      background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.08)',
+                      borderRadius: 'var(--radius-sm)', padding: '0.75rem', color: 'var(--text-primary)',
+                      fontSize: '0.86rem', lineHeight: 1.6, fontFamily: 'monospace',
+                      resize: 'none',
+                    }}
+                    value={activeLetter.text}
+                    onChange={(e) => setActiveLetter({ ...activeLetter, text: e.target.value })}
+                  />
+                  <div style={{ display: 'flex', gap: '0.75rem', justifyContent: 'end', marginTop: '0.5rem' }}>
+                    <button 
+                      className="page-btn"
+                      onClick={() => {
+                        navigator.clipboard.writeText(activeLetter.text);
+                        alert("Cover letter copied to clipboard!");
+                      }}
+                    >
+                      📋 Copy
+                    </button>
+                    <button 
+                      className="page-btn"
+                      onClick={() => {
+                        const element = document.createElement("a");
+                        const file = new Blob([activeLetter.text], { type: 'text/plain' });
+                        element.href = URL.createObjectURL(file);
+                        element.download = `Cover_Letter_${activeLetter.company.replace(/\s+/g, '_')}.txt`;
+                        document.body.appendChild(element);
+                        element.click();
+                        document.body.removeChild(element);
+                      }}
+                      style={{ background: 'var(--purple-gradient)', color: 'white', border: 'none' }}
+                    >
+                      📥 Download .txt
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

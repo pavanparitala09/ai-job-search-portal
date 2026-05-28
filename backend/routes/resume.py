@@ -11,7 +11,7 @@ import io
 from typing import List, Optional
 from pathlib import Path
 
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException, Request
 from pydantic import BaseModel
 
 # Load .env explicitly from the backend directory
@@ -25,44 +25,52 @@ from models import Job
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# ── Gemini lazy init (avoids undefined _gemini_model bug) ─────────────────────
-_gemini_model = None
-_gemini_ready = False
-_gemini_error = ""
+def _get_client_id(request: Request) -> str:
+    """Generate a unique privacy-safe SHA-256 hash for each user based on IP and User-Agent."""
+    import hashlib
+    ip_address = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("user-agent", "unknown")
+    raw_hash = f"{ip_address}-{user_agent}"
+    return hashlib.sha256(raw_hash.encode()).hexdigest()
 
-def _init_gemini():
-    """Initialize Gemini. Called lazily on first use."""
-    global _gemini_model, _gemini_ready, _gemini_error
 
-    if _gemini_ready:
+# ── Groq lazy init (avoids undefined _groq_client bug) ─────────────────────────
+_groq_client = None
+_groq_ready = False
+_groq_error = ""
+
+def _init_groq():
+    """Initialize Groq. Called lazily on first use."""
+    global _groq_client, _groq_ready, _groq_error
+
+    if _groq_ready:
         return True
 
-    key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not key or key == "your_gemini_api_key_here":
-        _gemini_error = "GEMINI_API_KEY not set in backend/.env"
-        return False
-
-    if not key.startswith("AIza"):
-        _gemini_error = (
-            f"Invalid API key format (starts with '{key[:8]}...'). "
-            "Gemini keys must start with 'AIza'. "
-            "Get a valid key at https://aistudio.google.com/app/apikey"
-        )
-        logger.error(f"❌ {_gemini_error}")
+    # Reload env to pick up any runtime changes to .env file
+    load_dotenv(dotenv_path=_env_path, override=True)
+    key = os.getenv("GROQ_API_KEY", "").strip()
+    if not key or key == "your_groq_api_key_here":
+        _groq_error = "GROQ_API_KEY not set in backend/.env"
         return False
 
     try:
-        import google.generativeai as genai
-        genai.configure(api_key=key)
-        # Use gemini-2.5-flash — latest stable model supported by this key
-        _gemini_model = genai.GenerativeModel("gemini-2.5-flash")
-        _gemini_ready = True
-        _gemini_error = ""
-        logger.info("✅ Gemini initialized with model: gemini-2.5-flash")
+        from groq import Groq
+        client = Groq(api_key=key)
+        # Validate key with a simple generation call to fail early if invalid
+        client.chat.completions.create(
+            messages=[{"role": "user", "content": "ping"}],
+            model="llama-3.3-70b-versatile",
+            max_tokens=5,
+        )
+        _groq_client = client
+        _groq_ready = True
+        _groq_error = ""
+        logger.info("✅ Groq initialized and validated with model: llama-3.3-70b-versatile")
         return True
     except Exception as e:
-        _gemini_error = str(e)
-        logger.error(f"❌ Gemini init error: {e}")
+        _groq_ready = False
+        _groq_error = str(e)
+        logger.error(f"❌ Groq init/validation error: {e}")
         return False
 
 
@@ -100,6 +108,18 @@ class ResumeAnalysisResponse(BaseModel):
     improvements: List[ResumeImprovement] = []
     gemini_summary: Optional[str] = None
     powered_by: str = "TF-IDF"
+    resume_text: Optional[str] = None  # Return extracted resume text
+
+
+class CoverLetterRequest(BaseModel):
+    resume_text: str
+    job_id: int
+
+
+class CoverLetterResponse(BaseModel):
+    cover_letter: str
+    job_title: str
+    company: str
 
 
 # ── PDF extraction ────────────────────────────────────────────────────────────
@@ -246,11 +266,11 @@ def _tfidf_analysis(resume_text: str, jobs: list, top_n: int) -> ResumeAnalysisR
     )
 
 
-# ── Gemini analysis ───────────────────────────────────────────────────────────
-def _gemini_analysis(resume_text: str, jobs: list, top_n: int) -> ResumeAnalysisResponse:
-    """Full Gemini-powered analysis."""
+# ── Groq analysis ─────────────────────────────────────────────────────────────
+def _groq_analysis(resume_text: str, jobs: list, top_n: int, client_ip: str) -> ResumeAnalysisResponse:
+    """Full Groq-powered analysis."""
 
-    # Build compact job list — include index so Gemini can reference by index (more reliable than ID)
+    # Build compact job list — include index so Groq can reference by index (more reliable than ID)
     job_entries = []
     sample_jobs = jobs[:40]  # Limit to 40 for token budget
     for i, job in enumerate(sample_jobs):
@@ -276,7 +296,7 @@ Return ONLY a valid JSON object. No explanation, no markdown, no code blocks.
   "summary": "Brief 2-3 sentence professional assessment of this candidate.",
   "improvements": [
     {{
-      "category": "Mistake / Formatting / Content / Grammar",
+      "category": "Grammar/Spelling",
       "issue": "Specific mistake or vague text found in the resume",
       "suggestion": "Actionable fix for the mistake"
     }}
@@ -299,8 +319,7 @@ Rules:
 - match_score: 0-100
 - improvements: 4-6 specific identified issues and actionable suggestions based on THIS specific resume. You MUST look for and include mistakes such as grammar issues, spelling errors, poor formatting, missing sections, and vague achievements. Be highly critical.
 - category: Use one of "Grammar/Spelling", "Formatting", "Impact", "Content", "Missing Section".
-
-IMPORTANT: Return only raw JSON. Do not wrap in ```json``` or add any text outside the JSON."""
+"""
 
     try:
         import time
@@ -313,7 +332,8 @@ IMPORTANT: Return only raw JSON. Do not wrap in ```json``` or add any text outsi
         try:
             today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
             calls_today = db.query(APILog).filter(
-                APILog.endpoint.like('%gemini%'), 
+                APILog.endpoint.like('%groq%'), 
+                APILog.ip_address == client_ip,
                 APILog.timestamp >= today_start
             ).count()
             
@@ -321,24 +341,25 @@ IMPORTANT: Return only raw JSON. Do not wrap in ```json``` or add any text outsi
             limit = int(setting.value) if setting else 100
             
             if calls_today >= limit:
-                logger.warning(f"Gemini API limit reached ({calls_today}/{limit}). Falling back to TF-IDF.")
-                return _tf_idf_fallback(resume_text, jobs, top_n)
+                logger.warning(f"Groq API limit reached ({calls_today}/{limit}) for user {client_ip}. Falling back to TF-IDF.")
+                result = _tfidf_analysis(resume_text, jobs, top_n)
+                result.gemini_summary = "⚠️ limit_exceeded"
+                return result
         finally:
             db.close()
 
         start_time = time.time()
         
-        response = _gemini_model.generate_content(prompt)
+        response = _groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+        )
         
         duration = (time.time() - start_time) * 1000
-        log_external_api("gemini.googleapis.com/v1beta/models/gemini-2.5-flash", "POST", 200, duration)
+        log_external_api("api.groq.com/openai/v1/chat/completions", "POST", 200, duration, client_ip=client_ip)
             
-        raw = response.text.strip()
-
-        # Strip markdown fences if present
-        raw = re.sub(r'^```(?:json)?\s*\n?', '', raw)
-        raw = re.sub(r'\n?```\s*$', '', raw)
-        raw = raw.strip()
+        raw = response.choices[0].message.content.strip()
 
         # Find JSON object in response
         json_match = re.search(r'\{.*\}', raw, re.DOTALL)
@@ -360,7 +381,6 @@ IMPORTANT: Return only raw JSON. Do not wrap in ```json``` or add any text outsi
 
         top_matches: List[JobMatchResult] = []
         for m in raw_matches:
-            # Use job_index to look up in our sample_jobs list
             job_idx = m.get("job_index")
             if job_idx is None or not isinstance(job_idx, int) or job_idx >= len(sample_jobs):
                 continue
@@ -379,9 +399,8 @@ IMPORTANT: Return only raw JSON. Do not wrap in ```json``` or add any text outsi
                 suggestions=[m.get("suggestion", "")] if m.get("suggestion") else [],
             ))
 
-        # If Gemini returned no valid matches, supplement with TF-IDF
         if not top_matches:
-            logger.warning("Gemini returned no valid job matches, using TF-IDF for matches.")
+            logger.warning("Groq returned no valid job matches, using TF-IDF for matches.")
             fb = _tfidf_analysis(resume_text, jobs, top_n)
             top_matches = fb.top_matches
 
@@ -389,29 +408,31 @@ IMPORTANT: Return only raw JSON. Do not wrap in ```json``` or add any text outsi
             top_matches=top_matches,
             overall_score=overall_score,
             detected_skills=detected_skills,
-            improvement_tips=improvement_tips[:4],  # Legacy field
-            improvements=raw_improvements[:5],      # New structured field
+            improvement_tips=improvement_tips[:4],
+            improvements=raw_improvements[:5],
             gemini_summary=summary,
-            powered_by="Gemini AI",
+            powered_by="Groq AI",
         )
 
     except json.JSONDecodeError as e:
-        logger.error(f"Gemini JSON parse error: {e}")
-        logger.error(f"Raw response (first 600 chars): {raw[:600] if 'raw' in dir() else 'N/A'}")
-        # Fallback to TF-IDF but keep any extracted summary
+        logger.error(f"Groq JSON parse error: {e}")
+        logger.error(f"Raw response (first 600 chars): {raw if 'raw' in locals() else 'N/A'}")
         result = _tfidf_analysis(resume_text, jobs, top_n)
-        result.gemini_summary = "⚠️ Gemini response could not be parsed. Showing TF-IDF results."
+        result.gemini_summary = "⚠️ Groq response could not be parsed. Showing TF-IDF results."
         return result
 
     except Exception as e:
-        logger.error(f"Gemini analysis exception: {e}")
+        logger.error(f"Groq analysis exception: {e}")
+        global _groq_ready, _groq_error
+        _groq_ready = False
+        _groq_error = str(e)
         result = _tfidf_analysis(resume_text, jobs, top_n)
-        result.gemini_summary = f"⚠️ Gemini error: {str(e)[:100]}"
+        result.gemini_summary = f"⚠️ Groq error: {str(e)[:100]}"
         return result
 
 
 # ── Core entry point ──────────────────────────────────────────────────────────
-def _run_analysis(resume_text: str, top_n: int) -> ResumeAnalysisResponse:
+def _run_analysis(resume_text: str, top_n: int, client_ip: str) -> ResumeAnalysisResponse:
     db = SessionLocal()
     try:
         jobs = db.query(Job).filter(Job.is_active == True).order_by(Job.id.desc()).limit(300).all()
@@ -424,19 +445,26 @@ def _run_analysis(resume_text: str, top_n: int) -> ResumeAnalysisResponse:
                 improvement_tips=["No jobs in database yet. The backend scrapes jobs automatically every day at midnight."],
                 gemini_summary="Please wait for the job scraper to complete its first run.",
                 powered_by="N/A",
+                resume_text=resume_text,
             )
 
-        # Try Gemini (lazy init)
-        if _init_gemini():
+        # Try Groq (lazy init)
+        if _init_groq():
             try:
-                return _gemini_analysis(resume_text, jobs, top_n)
+                res = _groq_analysis(resume_text, jobs, top_n, client_ip)
+                res.resume_text = resume_text
+                return res
             except Exception as e:
-                logger.error(f"Gemini analysis failed, using TF-IDF fallback: {e}")
+                logger.error(f"Groq analysis failed, using TF-IDF fallback: {e}")
+                global _groq_ready, _groq_error
+                _groq_ready = False
+                _groq_error = str(e)
 
         # TF-IDF fallback
         result = _tfidf_analysis(resume_text, jobs, top_n)
-        if _gemini_error:
-            result.gemini_summary = f"⚠️ Gemini unavailable: {_gemini_error}"
+        result.resume_text = resume_text
+        if _groq_error:
+            result.gemini_summary = f"⚠️ Groq unavailable: {_groq_error}"
         return result
 
     finally:
@@ -445,32 +473,57 @@ def _run_analysis(resume_text: str, top_n: int) -> ResumeAnalysisResponse:
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 @router.get("/status")
-def resume_ai_status():
-    """Check Gemini status. Also triggers lazy init so you see real errors."""
-    ready = _init_gemini()
+def resume_ai_status(request: Request):
+    """Check Groq status. Also triggers lazy init so you see real errors."""
+    ready = _init_groq()
     db = SessionLocal()
     try:
         job_count = db.query(Job).filter(Job.is_active == True).count()
+        
+        # Check daily limit status
+        from datetime import datetime, timezone
+        from models import APILog, SystemSetting
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        client_ip = _get_client_id(request)
+        calls_today = db.query(APILog).filter(
+            APILog.endpoint.like('%groq%'), 
+            APILog.ip_address == client_ip,
+            APILog.timestamp >= today_start
+        ).count()
+        
+        setting = db.query(SystemSetting).filter(SystemSetting.key == "resume_analyzer_limit").first()
+        limit = int(setting.value) if setting else 100
+        
+        limit_exceeded = calls_today >= limit
     finally:
         db.close()
 
+    if limit_exceeded:
+        return {
+            "gemini_ready": False,
+            "gemini_error": f"Daily limit exceeded ({calls_today}/{limit})",
+            "model": "llama-3.3-70b-versatile",
+            "jobs_in_database": job_count,
+            "message": f"⚠️ Daily analysis limit reached ({calls_today}/{limit}). Please come back tomorrow when reset.",
+        }
+
     return {
         "gemini_ready": ready,
-        "gemini_error": _gemini_error if not ready else None,
-        "model": "gemini-2.5-flash" if ready else None,
+        "gemini_error": _groq_error if not ready else None,
+        "model": "llama-3.3-70b-versatile" if ready else None,
         "jobs_in_database": job_count,
         "message": (
-            f"✅ Gemini AI active — {job_count} jobs ready to match"
+            f"✅ Groq AI active — {job_count} jobs ready to match"
             if ready
-            else f"⚠️ {_gemini_error or 'Gemini not configured'} — Using TF-IDF fallback ({job_count} jobs)"
+            else f"⚠️ {_groq_error or 'Groq not configured'} — Using TF-IDF fallback ({job_count} jobs)"
         ),
     }
 
 
 @router.get("/debug")
 def resume_debug():
-    """Debug endpoint: shows env, Gemini status, DB job count."""
-    key = os.getenv("GEMINI_API_KEY", "")
+    """Debug endpoint: shows env, Groq status, DB job count."""
+    key = os.getenv("GROQ_API_KEY", "")
     db = SessionLocal()
     try:
         jobs = db.query(Job).filter(Job.is_active == True).all()
@@ -482,9 +535,9 @@ def resume_debug():
         "env_file_exists": _env_path.exists(),
         "api_key_set": bool(key),
         "api_key_prefix": key[:8] + "..." if key else "NOT SET",
-        "api_key_valid_format": key.startswith("AIza") if key else False,
-        "gemini_ready": _gemini_ready,
-        "gemini_error": _gemini_error,
+        "api_key_valid_format": True if key else False,
+        "gemini_ready": _groq_ready,
+        "gemini_error": _groq_error,
         "total_jobs": len(jobs),
         "jobs_with_skills": sum(1 for j in jobs if j.skills),
         "sources": list(set(j.source for j in jobs)),
@@ -492,18 +545,19 @@ def resume_debug():
 
 
 @router.post("/analyze-text", response_model=ResumeAnalysisResponse)
-def analyze_resume_text(request: ResumeTextRequest):
+def analyze_resume_text(request: Request, request_data: ResumeTextRequest):
     """Analyze pasted resume text."""
-    text = request.resume_text.strip()
+    text = request_data.resume_text.strip()
     if not text:
         raise HTTPException(status_code=400, detail="Resume text cannot be empty.")
     if len(text) < 30:
         raise HTTPException(status_code=400, detail="Resume text is too short. Please paste your full resume.")
-    return _run_analysis(text, request.top_n)
+    client_ip = _get_client_id(request)
+    return _run_analysis(text, request_data.top_n, client_ip)
 
 
 @router.post("/analyze-file", response_model=ResumeAnalysisResponse)
-async def analyze_resume_file(file: UploadFile = File(...), top_n: int = 10):
+async def analyze_resume_file(request: Request, file: UploadFile = File(...), top_n: int = 10):
     """Upload a resume file (PDF or TXT) for AI analysis."""
     fname = (file.filename or "").lower()
     if not (fname.endswith(".pdf") or fname.endswith(".txt")):
@@ -524,4 +578,92 @@ async def analyze_resume_file(file: UploadFile = File(...), top_n: int = 10):
                 "Try saving it as a text file, or copy-paste the content using 'Paste Text' mode."
             )
         )
-    return _run_analysis(text.strip(), top_n)
+    client_ip = _get_client_id(request)
+    return _run_analysis(text.strip(), top_n, client_ip)
+
+
+@router.post("/generate-cover-letter", response_model=CoverLetterResponse)
+def generate_cover_letter(request: Request, request_data: CoverLetterRequest):
+    """Generate a cover letter for a specific job based on the resume text."""
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.id == request_data.job_id).first()
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found.")
+
+        if not _init_groq():
+            raise HTTPException(
+                status_code=503,
+                detail=f"Groq AI is currently unavailable: {_groq_error or 'Not configured'}"
+            )
+
+        client_ip = _get_client_id(request)
+
+        # Check daily limit for this user
+        from datetime import datetime, timezone
+        from models import APILog, SystemSetting
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        calls_today = db.query(APILog).filter(
+            APILog.endpoint.like('%groq%'), 
+            APILog.ip_address == client_ip,
+            APILog.timestamp >= today_start
+        ).count()
+        
+        setting = db.query(SystemSetting).filter(SystemSetting.key == "resume_analyzer_limit").first()
+        limit = int(setting.value) if setting else 100
+        
+        if calls_today >= limit:
+            raise HTTPException(
+                status_code=429,
+                detail="Daily AI analysis limit reached. Please come back tomorrow when reset."
+            )
+
+        prompt = f"""You are an expert career coach and professional writer. Write a highly tailored, compelling, and professional cover letter for the candidate based on their resume and the target job description. 
+
+=== CANDIDATE RESUME ===
+{request_data.resume_text[:2800]}
+
+=== TARGET JOB ===
+Title: {job.title}
+Company: {job.company}
+Description: {job.description or 'not listed'}
+Requirements: {job.requirements or 'not listed'}
+Skills: {job.skills or 'not listed'}
+
+=== INSTRUCTIONS ===
+- The cover letter should be professional, polite, and persuasive.
+- Explicitly connect the candidate's matching skills/experience from the resume to the requirements of the job.
+- Address any obvious gaps diplomatically, focusing on eagerness to learn and adaptability.
+- Do NOT make up false information or achievements not present in the resume.
+- Keep it concise (around 250-350 words, maximum 3-4 paragraphs).
+- Use standard business letter format (without specific placeholder dates or addresses, start directly with "Dear Hiring Team at {job.company}," and end with "Sincerely, [Candidate Name]").
+
+Return ONLY the plain text of the cover letter. No explanations, no markdown formatting (except newlines), no headers, no conversational intro/outro from you. Start directly with the greeting."""
+
+        try:
+            import time
+            from database import log_external_api
+
+            start_time = time.time()
+            response = _groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+            )
+            duration = (time.time() - start_time) * 1000
+            log_external_api("api.groq.com/openai/v1/chat/completions", "POST", 200, duration, client_ip=client_ip)
+
+            cover_letter_text = response.choices[0].message.content.strip()
+
+            return CoverLetterResponse(
+                cover_letter=cover_letter_text,
+                job_title=job.title,
+                company=job.company
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to generate cover letter: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to generate cover letter: {str(e)}")
+
+    finally:
+        db.close()
+

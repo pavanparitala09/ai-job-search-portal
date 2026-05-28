@@ -97,7 +97,8 @@ export default function AdminDashboard() {
       await api.post('/api/admin/scrape', {}, { headers: { Authorization: `Bearer ${token}` } });
       
       if (eventSourceRef.current) eventSourceRef.current.close();
-      const sseUrl = `http://localhost:8000/api/admin/scrape-stream?token=${token}`;
+      const baseUrl = api.defaults.baseURL.endsWith('/') ? api.defaults.baseURL.slice(0, -1) : api.defaults.baseURL;
+      const sseUrl = `${baseUrl}/api/admin/scrape-stream?token=${token}`;
       const source = new EventSource(sseUrl);
       
       source.onmessage = (event) => {

@@ -13,7 +13,7 @@ engine = create_engine(
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-def log_external_api(endpoint: str, method: str, status_code: int, duration_ms: float):
+def log_external_api(endpoint: str, method: str, status_code: int, duration_ms: float, client_ip: str = "external"):
     from models import APILog
     db = SessionLocal()
     try:
@@ -21,7 +21,7 @@ def log_external_api(endpoint: str, method: str, status_code: int, duration_ms: 
             endpoint=endpoint,
             method=method,
             status_code=status_code,
-            ip_address="external",
+            ip_address=client_ip,
             duration_ms=duration_ms
         ))
         db.commit()
