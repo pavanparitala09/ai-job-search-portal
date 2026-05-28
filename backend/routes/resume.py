@@ -125,13 +125,18 @@ class CoverLetterResponse(BaseModel):
 # ── PDF extraction ────────────────────────────────────────────────────────────
 def _extract_pdf_text(content: bytes) -> str:
     """Try multiple PDF libraries to extract text."""
+    extracted = ""
+
     # Method 1: pdfplumber (best quality)
     try:
         import pdfplumber
         with pdfplumber.open(io.BytesIO(content)) as pdf:
-            return "\n".join(p.extract_text() or "" for p in pdf.pages)
+            extracted = "\n".join(p.extract_text() or "" for p in pdf.pages)
+        if extracted.strip():
+            logger.info("PDF extracted via pdfplumber")
+            return extracted
     except ImportError:
-        pass
+        logger.warning("pdfplumber not installed — trying PyPDF2")
     except Exception as e:
         logger.warning(f"pdfplumber failed: {e}")
 
@@ -139,9 +144,12 @@ def _extract_pdf_text(content: bytes) -> str:
     try:
         import PyPDF2
         reader = PyPDF2.PdfReader(io.BytesIO(content))
-        return "\n".join(p.extract_text() or "" for p in reader.pages)
+        extracted = "\n".join(p.extract_text() or "" for p in reader.pages)
+        if extracted.strip():
+            logger.info("PDF extracted via PyPDF2")
+            return extracted
     except ImportError:
-        pass
+        logger.warning("PyPDF2 not installed — trying pymupdf")
     except Exception as e:
         logger.warning(f"PyPDF2 failed: {e}")
 
@@ -149,18 +157,24 @@ def _extract_pdf_text(content: bytes) -> str:
     try:
         import fitz  # pymupdf
         doc = fitz.open(stream=content, filetype="pdf")
-        return "\n".join(page.get_text() for page in doc)
+        extracted = "\n".join(page.get_text() for page in doc)
+        if extracted.strip():
+            logger.info("PDF extracted via PyMuPDF")
+            return extracted
     except ImportError:
-        pass
+        logger.warning("PyMuPDF not installed — trying raw byte fallback")
     except Exception as e:
         logger.warning(f"PyMuPDF failed: {e}")
 
-    # Method 4: raw byte extraction (crude fallback)
+    # Method 4: raw byte extraction (crude fallback — strips binary noise)
     try:
         raw = content.decode("latin-1", errors="ignore")
-        # Extract readable ASCII
+        # Keep only printable ASCII + newlines/tabs
         text = re.sub(r"[^\x20-\x7e\n\t]", " ", raw)
-        text = re.sub(r" {4,}", " ", text)
+        # Collapse excessive whitespace runs
+        text = re.sub(r"[ \t]{4,}", " ", text)
+        text = re.sub(r"\n{4,}", "\n\n", text)
+        logger.warning("PDF extracted via raw byte fallback — quality may be low")
         return text
     except Exception:
         return ""
@@ -570,12 +584,13 @@ async def analyze_resume_file(request: Request, file: UploadFile = File(...), to
         raise HTTPException(status_code=400, detail="File size exceeds 5MB limit.")
 
     text = _extract_file_text(content, file.filename)
-    if not text or len(text.strip()) < 20:
+    if not text or len(text.strip()) < 10:
         raise HTTPException(
-            status_code=400,
+            status_code=422,
             detail=(
-                "Could not extract readable text from this PDF. "
-                "Try saving it as a text file, or copy-paste the content using 'Paste Text' mode."
+                "Could not extract readable text from your PDF. "
+                "This usually happens with scanned/image-based PDFs. "
+                "Please switch to '📝 Paste Text' mode and paste your resume content directly — it works just as well!"
             )
         )
     client_ip = _get_client_id(request)
